@@ -250,9 +250,17 @@ def compose(frame, ppu, unit, lines, scale_bar):
 # ======================================================================
 # Stacking (pure OpenCV)
 # ======================================================================
-def align_to(ref_gray, frame):
-    """Warp `frame` onto the reference (shift, rotation, slight scale). Falls back to the
-    unaligned frame if the optimiser cannot converge."""
+def warp_frame(frame, warp):
+    if warp is None:
+        return frame
+    h, w = frame.shape[:2]
+    return cv2.warpAffine(frame, warp, (w, h),
+                          flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                          borderMode=cv2.BORDER_REPLICATE)
+
+
+def estimate_warp(ref_gray, frame):
+    """Estimate affine warp for `frame` onto the reference. Returns None if invalid."""
     g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     s = 0.5
     a = cv2.resize(ref_gray, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
@@ -262,29 +270,31 @@ def align_to(ref_gray, frame):
     try:
         _, warp = cv2.findTransformECC(a, b, warp, cv2.MOTION_AFFINE, criteria, None, 5)
     except cv2.error:
-        return frame
+        return None
 
-    # Reject implausible warps that would introduce obvious distortion.
     if not np.isfinite(warp).all():
-        return frame
+        return None
     if abs(warp[0, 0] - 1) > 0.5 or abs(warp[1, 1] - 1) > 0.5:
-        return frame
+        return None
     if abs(warp[0, 2]) > 0.5 * max(frame.shape[:2]) or abs(warp[1, 2]) > 0.5 * max(frame.shape[:2]):
-        return frame
-
-    warp[:, 2] /= s                                 # translation back to full resolution
-    h, w = frame.shape[:2]
-    return cv2.warpAffine(frame, warp, (w, h),
-                          flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
-                          borderMode=cv2.BORDER_REPLICATE)
+        return None
+    warp[:, 2] /= s
+    return warp
 
 
-def stack_frames(frames, align=True, mode="focus", progress=None):
+def align_to(ref_gray, frame):
+    """Warp `frame` onto the reference (shift, rotation, slight scale). Falls back to the
+    unaligned frame if the optimiser cannot converge."""
+    warp = estimate_warp(ref_gray, frame)
+    return warp_frame(frame, warp) if warp is not None else frame
+
+
+def stack_frames(frames, align=True, mode="focus", progress=None, cancelled=None):
     """mode 'focus': per-pixel sharpest frame (extended depth of field).
     mode 'average': mean of frames (noise reduction for a static subject).
 
-    This keeps memory usage down by avoiding a full `aligned` list; each frame is
-    aligned and processed on the fly.
+    This keeps memory usage down by avoiding a full `aligned` list while still
+    reusing the alignment estimate within the focus pass.
     """
     n = len(frames)
     if n == 0:
@@ -295,6 +305,8 @@ def stack_frames(frames, align=True, mode="focus", progress=None):
 
     def tick():
         nonlocal done
+        if cancelled and cancelled():
+            raise InterruptedError("stack cancelled")
         done += 1
         if progress:
             progress(done, total)
@@ -313,8 +325,13 @@ def stack_frames(frames, align=True, mode="focus", progress=None):
     h, w = frames[0].shape[:2]
     best = None
     index = np.zeros((h, w), np.uint8)
+    warps = [None] * n
+    aligned = [None] * n
     for i, f in enumerate(frames):
-        current = align_to(ref_gray, f) if align and i != ref else f
+        warp = estimate_warp(ref_gray, f) if align and i != ref else None
+        warps[i] = warp
+        current = warp_frame(f, warp) if warp is not None else f
+        aligned[i] = current
         g = cv2.GaussianBlur(cv2.cvtColor(current, cv2.COLOR_BGR2GRAY), (3, 3), 0)
         sharp = cv2.GaussianBlur(np.abs(cv2.Laplacian(g, cv2.CV_32F, ksize=3)), (0, 0), 3)
         if best is None:
@@ -328,8 +345,8 @@ def stack_frames(frames, align=True, mode="focus", progress=None):
 
     num = np.zeros((h, w, 3), np.float32)
     den = np.zeros((h, w), np.float32)
-    for i, f in enumerate(frames):
-        current = align_to(ref_gray, f) if align and i != ref else f
+    for i, _ in enumerate(frames):
+        current = aligned[i]
         weight = cv2.GaussianBlur((index == i).astype(np.float32), (0, 0), 4)
         num += current.astype(np.float32) * weight[..., None]
         den += weight
@@ -425,6 +442,11 @@ class V4L2Worker(QThread):
         self.jobs.put(job)
 
     def stop(self):
+        while True:
+            try:
+                self.jobs.get_nowait()
+            except queue.Empty:
+                break
         self.post("quit")
         self.wait(3000)
 
@@ -745,8 +767,11 @@ class StackThread(QThread):
     def run(self):
         try:
             result = stack_frames(self.frames, self.align, self.mode,
-                                  lambda i, n: self.progress.emit(i, n))
+                                  lambda i, n: self.progress.emit(i, n),
+                                  cancelled=self.isInterruptionRequested)
             self.done.emit(result)
+        except InterruptedError:
+            return
         except Exception as exc:
             logging.exception("stacking failed")
             self.failed.emit(str(exc))
@@ -929,6 +954,8 @@ class MainWindow(QMainWindow):
         self.tune_until = self.tune_started = 0.0
         self._saver_threads = set()
         self._last_stack_result = None
+        self._overlay_cache = None
+        self._overlay_key = None
         self.available_resolutions = detect_camera_resolutions(device)
         if not any((width, height) == res for res in self.available_resolutions):
             self.available_resolutions.insert(0, (width, height))
@@ -1013,6 +1040,8 @@ class MainWindow(QMainWindow):
                 width, height = 1600, 1200
         self.latest = None
         self.still = None
+        self._overlay_cache = None
+        self._overlay_key = None
         self.camera_failed = False
         self.capture_btn.setEnabled(False)
         self.freeze_btn.setEnabled(False)
@@ -1248,11 +1277,15 @@ class MainWindow(QMainWindow):
             if self.still is None:
                 self.view.set_text("Camera unavailable")
             return
-        if self.still is not None:             # overlays only on frozen/opened images
+        if self.still is not None:
             ppu, unit = self.current_cal(base.shape[1])
             lines = self.measures + ([self.drag] if self.drag else [])
             if lines or (self.scale_bar_on and ppu):
-                base = compose(base, ppu, unit, lines, self.scale_bar_on)
+                key = (base.shape[:2], ppu, unit, self.scale_bar_on, tuple((tuple(p1), tuple(p2)) for p1, p2 in lines))
+                if self._overlay_key != key or self._overlay_cache is None:
+                    self._overlay_cache = compose(base, ppu, unit, lines, self.scale_bar_on)
+                    self._overlay_key = key
+                base = self._overlay_cache
         self.view.set_frame(base)
 
     def show_still(self, img, message, path=None):
@@ -1263,6 +1296,8 @@ class MainWindow(QMainWindow):
         self.freeze_btn.setEnabled(True)
         self.capture_btn.setEnabled(True)
         self.view.setCursor(Qt.CrossCursor)
+        self._overlay_cache = None
+        self._overlay_key = None
         self.update_measure_list()
         self.refresh_view()
         self.status.setText(message)
@@ -1273,6 +1308,8 @@ class MainWindow(QMainWindow):
                 self.view.set_text("Waiting for camera...")
             self.still, self.measures, self.drag = None, [], None
             self.still_path = None
+            self._overlay_cache = None
+            self._overlay_key = None
             self.freeze_btn.setText("Freeze (F)")
             self.view.setCursor(Qt.ArrowCursor)
             self.update_measure_list()
@@ -1304,6 +1341,8 @@ class MainWindow(QMainWindow):
         saved = load_calibration(path)
         if saved is not None:
             self.cal = saved
+        self._overlay_cache = None
+        self._overlay_key = None
         self.show_still(img, f"Opened {Path(path).name}", path=path)
 
     # ---------------- library ----------------
@@ -1450,6 +1489,9 @@ class MainWindow(QMainWindow):
         self.measure_rb.setChecked(True)
         self.update_cal_label()
         self.update_measure_list()
+        self._overlay_cache = None
+        self._overlay_key = None
+        self.refresh_view()
         self.status.setText(f"Calibrated: {px / length:.2f} px per {unit}")
 
     def update_cal_label(self):
@@ -1460,6 +1502,8 @@ class MainWindow(QMainWindow):
 
     def on_scale_bar(self, on):
         self.scale_bar_on = on
+        self._overlay_cache = None
+        self._overlay_key = None
         self.refresh_view()
 
     def update_measure_list(self):
@@ -1473,11 +1517,15 @@ class MainWindow(QMainWindow):
     def undo_measure(self):
         if self.measures:
             self.measures.pop()
+            self._overlay_cache = None
+            self._overlay_key = None
             self.update_measure_list()
             self.refresh_view()
 
     def clear_measures(self):
         self.measures = []
+        self._overlay_cache = None
+        self._overlay_key = None
         self.update_measure_list()
         self.refresh_view()
 
