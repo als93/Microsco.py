@@ -108,7 +108,7 @@ LICENSE         — MIT
 
 ## License
 
-MIT — see `LICENSE`.
+GNU GPLv3 — see `LICENSE`.
 
 ## Credits
 
