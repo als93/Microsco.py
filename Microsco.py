@@ -9,6 +9,7 @@ Usage:  python3 app.py [/dev/videoN] [--size WIDTHxHEIGHT]
 Keys:   C capture, F freeze/live, S start/stop auto-capture, [ ] previous/next library image
 """
 import argparse
+import json
 import logging
 import math
 import os
@@ -40,6 +41,7 @@ MAX_STACK = 60            # frames are held in memory, about 5.5 MB each at 1600
 LIBRARY = Path.home() / "Pictures" / "Microscope"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 THUMB = 160               # thumbnail size (longest side) in the Library tab
+THUMB_HEIGHT = 112        # keep the icon viewport compact so wide microscope images are visible
 TUNE_TARGET = 115         # average brightness (0-255) that auto-tune aims for
 TUNE_TOLERANCE = 10       # close enough, either side of the target
 DEFAULT_RESOLUTIONS = (
@@ -91,6 +93,7 @@ def detect_camera_resolutions(device):
     containers or on systems where enumeration is not available.
     """
     seen = set()
+    format_name = None
     try:
         out = subprocess.run(
             ["v4l2-ctl", "-d", device, "--list-formats-ext"],
@@ -99,10 +102,17 @@ def detect_camera_resolutions(device):
     except (OSError, subprocess.SubprocessError):
         out = ""
     if out:
-        for match in re.finditer(r"Size:\s+(?:Discrete|Stepwise)\s+(\d+)x(\d+)", out):
-            w, h = int(match.group(1)), int(match.group(2))
-            if w > 0 and h > 0:
-                seen.add((w, h))
+        for line in out.splitlines():
+            m = re.match(r"\s*\[(?:\d+)\]:\s*'([^']+)'", line)
+            if m:
+                format_name = m.group(1)
+                continue
+            if format_name == "YUYV":
+                mm = re.search(r"Size:\s+(?:Discrete|Stepwise)\s+(\d+)x(\d+)", line)
+                if mm:
+                    w, h = int(mm.group(1)), int(mm.group(2))
+                    if w > 0 and h > 0:
+                        seen.add((w, h))
     if seen:
         return sorted(seen, key=lambda p: (p[0] * p[1], p[0]), reverse=True)
     base = [(int(w), int(h)) for w, h in DEFAULT_RESOLUTIONS if w > 0 and h > 0]
@@ -120,9 +130,19 @@ def library_days(root=LIBRARY):
 
 
 def library_files(day_dir):
-    """Images saved on one day, newest first. Raw stack frames (frame-*) are left out."""
-    files = [p for p in day_dir.rglob("*")
-             if p.suffix.lower() in IMAGE_EXTS and not p.name.startswith("frame-")]
+    """Images saved on one day, newest first. Raw stack frames and results copies are left out."""
+    if not day_dir.is_dir():
+        return []
+    files = []
+    for p in day_dir.rglob("*"):
+        if not p.is_file() or p.suffix.lower() not in IMAGE_EXTS:
+            continue
+        if p.name.startswith("frame-"):
+            continue
+        rel = p.relative_to(day_dir)
+        if "results" in rel.parts or "stacks" in rel.parts:
+            continue
+        files.append(p)
     return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
@@ -130,6 +150,45 @@ def thumb_label(name):
     """'photo-145055-993858.png' -> 'photo' and the time on two lines."""
     m = re.match(r"(.+?)-(\d{2})(\d{2})(\d{2})-\d", name)
     return f"{m.group(1)}\n{m.group(2)}:{m.group(3)}:{m.group(4)}" if m else name
+
+
+def calibration_path_for(path):
+    p = Path(path)
+    return p.with_suffix(p.suffix + ".cal.json")
+
+
+def load_calibration(path):
+    p = calibration_path_for(path)
+    if not p.exists():
+        return None
+    try:
+        with p.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return None
+        ppu = float(data.get("ppu", 0.0))
+        unit = str(data.get("unit", "mm"))
+        width = int(data.get("width", 0))
+        if ppu > 0 and width > 0:
+            return {"ppu": ppu, "unit": unit, "width": width}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def save_calibration(path, cal):
+    if not cal:
+        return
+    p = calibration_path_for(path)
+    try:
+        with p.open("w", encoding="utf-8") as fh:
+            json.dump({
+                "ppu": cal["ppu"],
+                "unit": cal["unit"],
+                "width": cal["width"],
+            }, fh)
+    except OSError:
+        pass
 
 
 # ======================================================================
@@ -204,6 +263,15 @@ def align_to(ref_gray, frame):
         _, warp = cv2.findTransformECC(a, b, warp, cv2.MOTION_AFFINE, criteria, None, 5)
     except cv2.error:
         return frame
+
+    # Reject implausible warps that would introduce obvious distortion.
+    if not np.isfinite(warp).all():
+        return frame
+    if abs(warp[0, 0] - 1) > 0.5 or abs(warp[1, 1] - 1) > 0.5:
+        return frame
+    if abs(warp[0, 2]) > 0.5 * max(frame.shape[:2]) or abs(warp[1, 2]) > 0.5 * max(frame.shape[:2]):
+        return frame
+
     warp[:, 2] /= s                                 # translation back to full resolution
     h, w = frame.shape[:2]
     return cv2.warpAffine(frame, warp, (w, h),
@@ -213,9 +281,16 @@ def align_to(ref_gray, frame):
 
 def stack_frames(frames, align=True, mode="focus", progress=None):
     """mode 'focus': per-pixel sharpest frame (extended depth of field).
-    mode 'average': mean of frames (noise reduction for a static subject)."""
+    mode 'average': mean of frames (noise reduction for a static subject).
+
+    This keeps memory usage down by avoiding a full `aligned` list; each frame is
+    aligned and processed on the fly.
+    """
     n = len(frames)
-    total = n * (3 if mode == "focus" else 2)
+    if n == 0:
+        raise ValueError("stack is empty")
+
+    total = n if mode == "average" else n * 2
     done = 0
 
     def tick():
@@ -226,37 +301,37 @@ def stack_frames(frames, align=True, mode="focus", progress=None):
 
     ref = n // 2                                     # middle frame: smallest scale change
     ref_gray = cv2.cvtColor(frames[ref], cv2.COLOR_BGR2GRAY)
-    aligned = []
-    for i, f in enumerate(frames):
-        aligned.append(align_to(ref_gray, f) if align and i != ref else f)
-        tick()
 
     if mode == "average":
-        acc = np.zeros(aligned[0].shape, np.float32)
-        for f in aligned:
-            acc += f
+        acc = np.zeros(frames[0].shape, np.float32)
+        for i, f in enumerate(frames):
+            current = align_to(ref_gray, f) if align and i != ref else f
+            acc += current
             tick()
         return np.clip(acc / n, 0, 255).astype(np.uint8)
 
+    h, w = frames[0].shape[:2]
     best = None
-    index = np.zeros(aligned[0].shape[:2], np.int32)
-    for i, f in enumerate(aligned):
-        g = cv2.GaussianBlur(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (3, 3), 0)
+    index = np.zeros((h, w), np.uint8)
+    for i, f in enumerate(frames):
+        current = align_to(ref_gray, f) if align and i != ref else f
+        g = cv2.GaussianBlur(cv2.cvtColor(current, cv2.COLOR_BGR2GRAY), (3, 3), 0)
         sharp = cv2.GaussianBlur(np.abs(cv2.Laplacian(g, cv2.CV_32F, ksize=3)), (0, 0), 3)
         if best is None:
             best = sharp
+            index[...] = i
         else:
             better = sharp > best
             best[better] = sharp[better]
             index[better] = i
         tick()
 
-    h, w = index.shape                               # soft-blend the choice to hide seams
     num = np.zeros((h, w, 3), np.float32)
     den = np.zeros((h, w), np.float32)
-    for i, f in enumerate(aligned):
+    for i, f in enumerate(frames):
+        current = align_to(ref_gray, f) if align and i != ref else f
         weight = cv2.GaussianBlur((index == i).astype(np.float32), (0, 0), 4)
-        num += f.astype(np.float32) * weight[..., None]
+        num += current.astype(np.float32) * weight[..., None]
         den += weight
         tick()
     return np.clip(num / np.maximum(den, 1e-6)[..., None], 0, 255).astype(np.uint8)
@@ -619,7 +694,10 @@ class CameraThread(QThread):
             self.error.emit(f"Could not open {self.device}. Is guvcview still running?")
             return
         try:
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+            # Prefer YUYV, but fall back to MJPG when the camera won't accept the fourcc.
+            for fourcc in ("YUYV", "MJPG", "UYVY"):
+                if cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc)):
+                    break
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -687,12 +765,16 @@ class ThumbThread(QThread):
             if self.isInterruptionRequested():
                 return
             try:
-                img = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
+                encoded = np.fromfile(str(path), dtype=np.uint8)
+                img = cv2.imdecode(encoded, cv2.IMREAD_REDUCED_COLOR_4)
+                if img is None or max(img.shape[:2]) < THUMB:
+                    img = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
             except (OSError, cv2.error):
                 img = None
             if img is None:
                 continue
-            scale = THUMB / max(img.shape[:2])
+            h, w = img.shape[:2]
+            scale = min(THUMB / w, THUMB_HEIGHT / h)
             resized = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
             self.thumb.emit(self.gen, row, np.ascontiguousarray(resized))
 
@@ -714,6 +796,35 @@ class SaveThread(QThread):
             self.failed.emit(str(exc))
         else:
             self.done.emit(str(self.path))
+
+
+class StackResultSaveThread(QThread):
+    """Save a stack result in both its stack folder and the date's results folder."""
+    done = Signal(str, str)
+    failed = Signal(str)
+
+    def __init__(self, stack_path, results_path, frame):
+        super().__init__()
+        self.stack_path = Path(stack_path)
+        self.results_path = Path(results_path)
+        self.frame = frame
+
+    def run(self):
+        try:
+            save_png(self.stack_path, self.frame)
+        except OSError as exc:
+            self.failed.emit(f"Could not save stack result: {exc}")
+            return
+
+        try:
+            save_png(self.results_path, self.frame)
+        except OSError as exc:
+            self.failed.emit(
+                f"Stack result saved to {self.stack_path}, "
+                f"but results copy failed: {exc}"
+            )
+        else:
+            self.done.emit(str(self.stack_path), str(self.results_path))
 
 
 # ======================================================================
@@ -800,12 +911,14 @@ class MainWindow(QMainWindow):
         self.requested = f"{width}x{height}"
         self.latest = None            # newest live frame
         self.still = None             # frozen or opened image (measuring happens here)
+        self.still_path = None        # source path for opened images, for calibration sidecars
         self.camera_failed = False
         self.cal = None               # {"ppu": px per unit, "unit": str, "width": image width}
         self.measures = []            # [((x1, y1), (x2, y2)), ...] in image pixels
         self.drag = None
         self.scale_bar_on = False
         self.stack_frames, self.stack_dir, self.stack_thread = [], None, None
+        self.stack_mode_used = "focus"
         self.frame_counter = 0        # counts live frames (detects a stalled camera)
         self.auto_state = "idle"      # idle | delay | running
         self.auto_next = self.auto_start = 0.0
@@ -814,6 +927,8 @@ class MainWindow(QMainWindow):
         self.tune_state = "idle"      # idle | locking | measuring
         self.tune_exp = self.tune_iter = self.tune_frames = 0
         self.tune_until = self.tune_started = 0.0
+        self._saver_threads = set()
+        self._last_stack_result = None
         self.available_resolutions = detect_camera_resolutions(device)
         if not any((width, height) == res for res in self.available_resolutions):
             self.available_resolutions.insert(0, (width, height))
@@ -827,7 +942,8 @@ class MainWindow(QMainWindow):
         self.capture_btn = QPushButton("Capture (C)")
         self.freeze_btn = QPushButton("Freeze (F)")
         self.open_btn = QPushButton("Open image...")
-        for b in (self.capture_btn, self.freeze_btn, self.open_btn):
+        self.reconnect_btn = QPushButton("Reconnect")
+        for b in (self.capture_btn, self.freeze_btn, self.open_btn, self.reconnect_btn):
             b.setFocusPolicy(Qt.NoFocus)
         self.capture_btn.setEnabled(False)
         self.freeze_btn.setEnabled(False)
@@ -840,7 +956,7 @@ class MainWindow(QMainWindow):
         self.resolution_combo.setCurrentText(self.requested)
         self.resolution_combo.currentIndexChanged.connect(self.on_resolution_change)
         row = QHBoxLayout()
-        for b in (self.capture_btn, self.freeze_btn, self.open_btn):
+        for b in (self.capture_btn, self.freeze_btn, self.open_btn, self.reconnect_btn):
             row.addWidget(b)
         row.addWidget(QLabel("Resolution"))
         row.addWidget(self.resolution_combo, 1)
@@ -875,6 +991,7 @@ class MainWindow(QMainWindow):
         self.capture_btn.clicked.connect(self.capture)
         self.freeze_btn.clicked.connect(self.toggle_freeze)
         self.open_btn.clicked.connect(self.open_image)
+        self.reconnect_btn.clicked.connect(self.reconnect_camera)
         for key, fn in (("C", self.capture), ("F", self.toggle_freeze), ("S", self.toggle_auto),
                         ("[", lambda: self.step_image(-1)), ("]", lambda: self.step_image(1))):
             sc = QShortcut(QKeySequence(key), self)
@@ -884,7 +1001,16 @@ class MainWindow(QMainWindow):
         self.cam = None
         self._restart_camera(width, height)
 
-    def _restart_camera(self, width, height):
+    def _track_saver(self, worker):
+        self._saver_threads.add(worker)
+        worker.finished.connect(lambda _w=worker: self._saver_threads.discard(_w))
+
+    def _restart_camera(self, width=None, height=None):
+        if width is None or height is None:
+            try:
+                width, height = map(int, self.requested.split("x"))
+            except ValueError:
+                width, height = 1600, 1200
         self.latest = None
         self.still = None
         self.camera_failed = False
@@ -893,6 +1019,12 @@ class MainWindow(QMainWindow):
         self.view.set_text("Connecting to camera...")
         self.requested = f"{width}x{height}"
         if self.cam is not None:
+            try:
+                self.cam.frame_ready.disconnect()
+                self.cam.mode_known.disconnect()
+                self.cam.error.disconnect()
+            except Exception:
+                pass
             self.cam.stop()
             self.cam.deleteLater()
         self.cam = CameraThread(self.device, width, height)
@@ -901,8 +1033,22 @@ class MainWindow(QMainWindow):
         self.cam.error.connect(self.on_camera_error)
         self.cam.start()
 
+    def reconnect_camera(self):
+        if self.auto_state != "idle" or self.tune_state != "idle":
+            return
+        try:
+            width, height = map(int, self.requested.split("x"))
+        except ValueError:
+            width, height = 1600, 1200
+        self._restart_camera(width, height)
+
     def on_resolution_change(self, index):
         if index < 0:
+            return
+        if self.auto_state != "idle" or self.tune_state != "idle":
+            self.resolution_combo.blockSignals(True)
+            self.resolution_combo.setCurrentText(self.requested)
+            self.resolution_combo.blockSignals(False)
             return
         size = self.resolution_combo.itemData(index)
         if not size:
@@ -974,10 +1120,10 @@ class MainWindow(QMainWindow):
         self.library.setViewMode(QListView.IconMode)
         self.library.setResizeMode(QListView.Adjust)
         self.library.setMovement(QListView.Static)
-        self.library.setIconSize(QSize(THUMB, THUMB))
+        self.library.setIconSize(QSize(THUMB, THUMB_HEIGHT))
         # Fixed cells. Without this, items are placed before their thumbnails exist and
         # the grid never re-flows when the icons arrive, so they overlap.
-        self.library.setGridSize(QSize(THUMB + 24, THUMB + 44))
+        self.library.setGridSize(QSize(THUMB + 24, THUMB_HEIGHT + 44))
         self.library.setUniformItemSizes(True)
         self.library.setWordWrap(True)
         self.library.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -1099,6 +1245,8 @@ class MainWindow(QMainWindow):
     def refresh_view(self):
         base = self.current_base()
         if base is None:
+            if self.still is None:
+                self.view.set_text("Camera unavailable")
             return
         if self.still is not None:             # overlays only on frozen/opened images
             ppu, unit = self.current_cal(base.shape[1])
@@ -1107,8 +1255,9 @@ class MainWindow(QMainWindow):
                 base = compose(base, ppu, unit, lines, self.scale_bar_on)
         self.view.set_frame(base)
 
-    def show_still(self, img, message):
+    def show_still(self, img, message, path=None):
         self.still = img
+        self.still_path = str(path) if path else None
         self.measures, self.drag = [], None
         self.freeze_btn.setText("Resume live (F)")
         self.freeze_btn.setEnabled(True)
@@ -1120,7 +1269,10 @@ class MainWindow(QMainWindow):
 
     def toggle_freeze(self):
         if self.still is not None:
+            if self.latest is None and not self.camera_failed:
+                self.view.set_text("Waiting for camera...")
             self.still, self.measures, self.drag = None, [], None
+            self.still_path = None
             self.freeze_btn.setText("Freeze (F)")
             self.view.setCursor(Qt.ArrowCursor)
             self.update_measure_list()
@@ -1128,6 +1280,9 @@ class MainWindow(QMainWindow):
             self.status.setText("Live")
         elif self.latest is not None:
             self.show_still(self.latest.copy(), "Frozen. Drag on the image to measure.")
+        elif self.camera_failed:
+            self.view.set_text("Camera unavailable")
+            self.status.setText("Camera unavailable")
 
     def open_image(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1136,6 +1291,8 @@ class MainWindow(QMainWindow):
             self.load_image(path)
 
     def load_image(self, path):
+        self.cal = None
+        self.still_path = None
         try:
             img = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
         except (OSError, cv2.error) as exc:
@@ -1144,7 +1301,10 @@ class MainWindow(QMainWindow):
         if img is None:
             self.status.setText("Could not read that image")
             return
-        self.show_still(img, f"Opened {Path(path).name}")
+        saved = load_calibration(path)
+        if saved is not None:
+            self.cal = saved
+        self.show_still(img, f"Opened {Path(path).name}", path=path)
 
     # ---------------- library ----------------
     def on_tab_changed(self, index):
@@ -1235,9 +1395,18 @@ class MainWindow(QMainWindow):
             self.status.setText(f"Save failed: {exc}")
             return
         worker = SaveThread(path, base)
-        worker.done.connect(lambda saved: self.status.setText(f"Saved {saved}"))
-        worker.failed.connect(lambda err: self.status.setText(f"Save failed: {err}"))
+        self._track_saver(worker)
+        worker.done.connect(self._capture_saved)
+        worker.failed.connect(self._capture_failed)
         worker.start()
+
+    @Slot(str)
+    def _capture_saved(self, saved):
+        self.status.setText(f"Saved {saved}")
+
+    @Slot(str)
+    def _capture_failed(self, err):
+        self.status.setText(f"Save failed: {err}")
 
     # ---------------- measuring ----------------
     def on_press(self, x, y):
@@ -1276,6 +1445,8 @@ class MainWindow(QMainWindow):
             return
         length, unit = parsed
         self.cal = {"ppu": px / length, "unit": unit, "width": self.still.shape[1]}
+        if self.still_path:
+            save_calibration(self.still_path, self.cal)
         self.measure_rb.setChecked(True)
         self.update_cal_label()
         self.update_measure_list()
@@ -1323,9 +1494,18 @@ class MainWindow(QMainWindow):
             self.status.setText(f"Save failed: {exc}")
             return
         worker = SaveThread(path, compose(self.still, ppu, unit, self.measures, self.scale_bar_on))
-        worker.done.connect(lambda saved: self.status.setText(f"Saved {saved}"))
-        worker.failed.connect(lambda err: self.status.setText(f"Save failed: {err}"))
+        self._track_saver(worker)
+        worker.done.connect(self._annotated_saved)
+        worker.failed.connect(self._annotated_failed)
         worker.start()
+
+    @Slot(str)
+    def _annotated_saved(self, saved):
+        self.status.setText(f"Saved {saved}")
+
+    @Slot(str)
+    def _annotated_failed(self, err):
+        self.status.setText(f"Save failed: {err}")
 
     # ---------------- exposure auto-tune ----------------
     def start_tune(self):
@@ -1344,6 +1524,7 @@ class MainWindow(QMainWindow):
             return
         if self.still is not None:
             self.toggle_freeze()                   # tune against the live image
+        self.resolution_combo.setEnabled(False)
         self.controls.lock_exposure()
         now = time.monotonic()
         self.tune_state = "locking"
@@ -1388,6 +1569,7 @@ class MainWindow(QMainWindow):
     def finish_tune(self, message):
         self.tune_timer.stop()
         self.tune_state = "idle"
+        self.resolution_combo.setEnabled(True)
         self.status.setText(message)
 
     # ---------------- auto-capture ----------------
@@ -1409,6 +1591,7 @@ class MainWindow(QMainWindow):
             return
         if self.still is not None:
             self.toggle_freeze()                   # back to the live view
+        self.resolution_combo.setEnabled(False)
         self.stack_frames, self.stack_dir = [], None   # every run is a fresh group/folder
         self.auto_settings.setEnabled(False)
         self.process_btn.setEnabled(False)
@@ -1421,6 +1604,8 @@ class MainWindow(QMainWindow):
 
     def take_shot(self):
         """Save the newest live frame into this run's folder. Returns True on success."""
+        if self.latest is None or self.camera_failed:
+            return False
         frame = self.latest.copy()
         try:
             if self.stack_dir is None:
@@ -1467,6 +1652,7 @@ class MainWindow(QMainWindow):
     def finish_auto(self, reason):
         self.auto_timer.stop()
         self.auto_state = "idle"
+        self.resolution_combo.setEnabled(True)
         self.auto_settings.setEnabled(True)
         self.process_btn.setEnabled(True)
         self.auto_btn.setText("Start auto-capture (S)")
@@ -1505,14 +1691,31 @@ class MainWindow(QMainWindow):
     def on_stack_done(self, result):
         self.process_btn.setEnabled(True)
         self.progress.hide()
+        self._last_stack_result = result
         try:
             path = unique_path(self.stack_dir, f"result-{self.stack_mode_used}")
-            worker = SaveThread(path, result)
-            worker.done.connect(lambda saved: self.show_still(result, f"Stack saved to {saved}"))
-            worker.failed.connect(lambda err: self.show_still(result, f"Stack done but save failed: {err}"))
-            worker.start()
+            results_dir = self.stack_dir.parent.parent / "results"
+            results_dir.mkdir(parents=True, exist_ok=True)
+            results_path = results_dir / path.name
+            if results_path.exists():
+                results_path = unique_path(results_dir, f"result-{self.stack_mode_used}")
         except OSError as exc:
-            self.show_still(result, f"Stack done but save failed: {exc}")
+            self.show_still(result, f"Stack done but could not prepare result files: {exc}")
+            return
+
+        worker = StackResultSaveThread(path, results_path, result)
+        self._track_saver(worker)
+        worker.done.connect(self._stack_result_saved)
+        worker.failed.connect(self._stack_result_failed)
+        worker.start()
+
+    @Slot(str, str)
+    def _stack_result_saved(self, saved, copy):
+        self.show_still(self._last_stack_result, f"Stack saved to {saved}; results copy saved to {copy}")
+
+    @Slot(str)
+    def _stack_result_failed(self, err):
+        self.show_still(self._last_stack_result, f"Stack done but save failed: {err}")
 
     @Slot(str)
     def on_stack_failed(self, text):
@@ -1524,10 +1727,13 @@ class MainWindow(QMainWindow):
         self.auto_timer.stop()
         self.tune_timer.stop()
         self.stop_thumbs()
+        for worker in list(self._saver_threads):
+            worker.wait(5000)
         if self.cam is not None:
             self.cam.stop()
         self.controls.shutdown()
         if self.stack_thread is not None and self.stack_thread.isRunning():
+            self.stack_thread.requestInterruption()
             self.stack_thread.wait(10000)
         super().closeEvent(event)
 
