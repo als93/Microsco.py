@@ -26,14 +26,14 @@ import cv2
 import numpy as np
 from PySide6.QtCore import QFile, QRectF, QSize, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import (QColor, QIcon, QImage, QKeySequence, QPainter, QPixmap,
-                           QShortcut)
+                            QShortcut)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
-                               QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout,
-                               QGroupBox, QHBoxLayout, QInputDialog, QLabel, QListView,
-                               QListWidget, QListWidgetItem, QMainWindow, QProgressBar,
-                               QPushButton, QRadioButton, QScrollArea, QSlider,
-                               QSpinBox, QTabWidget, QToolButton, QVBoxLayout,
-                               QWidget)
+                                QDockWidget, QDoubleSpinBox, QFileDialog, QFormLayout,
+                                QGroupBox, QHBoxLayout, QInputDialog, QLabel, QListView,
+                                QListWidget, QListWidgetItem, QMainWindow, QProgressBar,
+                                QPushButton, QRadioButton, QScrollArea, QSlider,
+                                QSpinBox, QTabWidget, QToolButton, QVBoxLayout,
+                                QWidget)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 MAX_STACK = 60            # frames are held in memory, about 5.5 MB each at 1600x1200
@@ -42,6 +42,15 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 THUMB = 160               # thumbnail size (longest side) in the Library tab
 TUNE_TARGET = 115         # average brightness (0-255) that auto-tune aims for
 TUNE_TOLERANCE = 10       # close enough, either side of the target
+DEFAULT_RESOLUTIONS = (
+    (1600, 1200),
+    (1280, 960),
+    (1280, 720),
+    (1024, 768),
+    (800, 600),
+    (640, 480),
+    (320, 240),
+)
 
 
 # ======================================================================
@@ -72,6 +81,34 @@ def save_png(path, frame):
     tmp = path.with_name(path.name + ".part")
     tmp.write_bytes(buf.tobytes())
     os.replace(tmp, path)
+
+
+def detect_camera_resolutions(device):
+    """Return a sorted list of (width, height) tuples for this camera.
+
+    If v4l2-ctl is unavailable or the device reports no discrete sizes, return an
+    ordered fallback list. This makes the resolution selector usable even in
+    containers or on systems where enumeration is not available.
+    """
+    seen = set()
+    try:
+        out = subprocess.run(
+            ["v4l2-ctl", "-d", device, "--list-formats-ext"],
+            capture_output=True, text=True, timeout=3, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    if out:
+        for match in re.finditer(r"Size:\s+(?:Discrete|Stepwise)\s+(\d+)x(\d+)", out):
+            w, h = int(match.group(1)), int(match.group(2))
+            if w > 0 and h > 0:
+                seen.add((w, h))
+    if seen:
+        return sorted(seen, key=lambda p: (p[0] * p[1], p[0]), reverse=True)
+    base = [(int(w), int(h)) for w, h in DEFAULT_RESOLUTIONS if w > 0 and h > 0]
+    if base:
+        return base
+    return [(640, 480)]
 
 
 def library_days(root=LIBRARY):
@@ -656,8 +693,27 @@ class ThumbThread(QThread):
             if img is None:
                 continue
             scale = THUMB / max(img.shape[:2])
-            self.thumb.emit(self.gen, row, cv2.resize(img, None, fx=scale, fy=scale,
-                                                      interpolation=cv2.INTER_AREA))
+            resized = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            self.thumb.emit(self.gen, row, np.ascontiguousarray(resized))
+
+
+class SaveThread(QThread):
+    """Background PNG saves so the GUI remains responsive."""
+    done = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, path, frame):
+        super().__init__()
+        self.path = Path(path)
+        self.frame = frame
+
+    def run(self):
+        try:
+            save_png(self.path, self.frame)
+        except OSError as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.done.emit(str(self.path))
 
 
 # ======================================================================
@@ -739,6 +795,7 @@ class PreviewView(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self, device, width, height):
         super().__init__()
+        self.device = device
         self.setWindowTitle(f"Microscope - {device}")
         self.requested = f"{width}x{height}"
         self.latest = None            # newest live frame
@@ -757,6 +814,10 @@ class MainWindow(QMainWindow):
         self.tune_state = "idle"      # idle | locking | measuring
         self.tune_exp = self.tune_iter = self.tune_frames = 0
         self.tune_until = self.tune_started = 0.0
+        self.available_resolutions = detect_camera_resolutions(device)
+        if not any((width, height) == res for res in self.available_resolutions):
+            self.available_resolutions.insert(0, (width, height))
+        self.available_resolutions = list(dict.fromkeys(self.available_resolutions))
 
         self.view = PreviewView()
         self.view.pressed.connect(self.on_press)
@@ -770,9 +831,19 @@ class MainWindow(QMainWindow):
             b.setFocusPolicy(Qt.NoFocus)
         self.capture_btn.setEnabled(False)
         self.freeze_btn.setEnabled(False)
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.setToolTip("Camera resolution")
+        for w, h in self.available_resolutions:
+            self.resolution_combo.addItem(f"{w}x{h}", (w, h))
+        if not self.resolution_combo.count():
+            self.resolution_combo.addItem(f"{width}x{height}", (width, height))
+        self.resolution_combo.setCurrentText(self.requested)
+        self.resolution_combo.currentIndexChanged.connect(self.on_resolution_change)
         row = QHBoxLayout()
         for b in (self.capture_btn, self.freeze_btn, self.open_btn):
             row.addWidget(b)
+        row.addWidget(QLabel("Resolution"))
+        row.addWidget(self.resolution_combo, 1)
         self.status = QLabel("Starting...")
 
         layout = QVBoxLayout()
@@ -810,11 +881,37 @@ class MainWindow(QMainWindow):
             sc.setAutoRepeat(False)
             sc.activated.connect(fn)
 
-        self.cam = CameraThread(device, width, height)
+        self.cam = None
+        self._restart_camera(width, height)
+
+    def _restart_camera(self, width, height):
+        self.latest = None
+        self.still = None
+        self.camera_failed = False
+        self.capture_btn.setEnabled(False)
+        self.freeze_btn.setEnabled(False)
+        self.view.set_text("Connecting to camera...")
+        self.requested = f"{width}x{height}"
+        if self.cam is not None:
+            self.cam.stop()
+            self.cam.deleteLater()
+        self.cam = CameraThread(self.device, width, height)
         self.cam.frame_ready.connect(self.show_frame)
         self.cam.mode_known.connect(self.on_mode)
         self.cam.error.connect(self.on_camera_error)
         self.cam.start()
+
+    def on_resolution_change(self, index):
+        if index < 0:
+            return
+        size = self.resolution_combo.itemData(index)
+        if not size:
+            return
+        width, height = size
+        if f"{width}x{height}" == self.requested:
+            return
+        self.status.setText(f"Switching camera to {width}x{height}...")
+        self._restart_camera(width, height)
 
     # ---------------- tabs ----------------
     def build_measure_tab(self):
@@ -884,8 +981,13 @@ class MainWindow(QMainWindow):
         self.library.setUniformItemSizes(True)
         self.library.setWordWrap(True)
         self.library.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.library.setSpacing(8)
         self.library.itemDoubleClicked.connect(lambda item: self.load_image(item.data(Qt.UserRole)))
+        self.library_empty = QLabel("No images in this day.")
+        self.library_empty.setAlignment(Qt.AlignCenter)
+        self.library_empty.hide()
         v.addWidget(self.library, 1)
+        v.addWidget(self.library_empty)
         trash = QPushButton("Move selected to Trash")
         trash.clicked.connect(lambda _=False: self.trash_selected())
         v.addWidget(trash)
@@ -1073,6 +1175,11 @@ class MainWindow(QMainWindow):
         self.library.clear()
         day = self.day_combo.currentText()
         paths = library_files(LIBRARY / day) if day else []
+        if not paths:
+            self.library_empty.setText(f"No images for {day or 'this library'}.")
+            self.library_empty.show()
+            return
+        self.library_empty.hide()
         for p in paths:
             item = QListWidgetItem(thumb_label(p.name))
             item.setData(Qt.UserRole, str(p))
@@ -1088,8 +1195,9 @@ class MainWindow(QMainWindow):
         item = self.library.item(row)
         if gen != self.thumb_gen or item is None:
             return
+        arr = np.ascontiguousarray(arr)
         h, w = arr.shape[:2]
-        img = QImage(arr.data, w, h, arr.strides[0], QImage.Format_BGR888)
+        img = QImage(arr.data, w, h, arr.strides[0], QImage.Format_BGR888).copy()
         item.setIcon(QIcon(QPixmap.fromImage(img)))
 
     def step_image(self, delta):
@@ -1123,11 +1231,13 @@ class MainWindow(QMainWindow):
         try:
             folder.mkdir(parents=True, exist_ok=True)
             path = unique_path(folder, "photo")
-            save_png(path, base)               # raw image, without overlays
         except OSError as exc:
             self.status.setText(f"Save failed: {exc}")
             return
-        self.status.setText(f"Saved {path}")
+        worker = SaveThread(path, base)
+        worker.done.connect(lambda saved: self.status.setText(f"Saved {saved}"))
+        worker.failed.connect(lambda err: self.status.setText(f"Save failed: {err}"))
+        worker.start()
 
     # ---------------- measuring ----------------
     def on_press(self, x, y):
@@ -1209,11 +1319,13 @@ class MainWindow(QMainWindow):
         try:
             folder.mkdir(parents=True, exist_ok=True)
             path = unique_path(folder, "annotated")
-            save_png(path, compose(self.still, ppu, unit, self.measures, self.scale_bar_on))
         except OSError as exc:
             self.status.setText(f"Save failed: {exc}")
             return
-        self.status.setText(f"Saved {path}")
+        worker = SaveThread(path, compose(self.still, ppu, unit, self.measures, self.scale_bar_on))
+        worker.done.connect(lambda saved: self.status.setText(f"Saved {saved}"))
+        worker.failed.connect(lambda err: self.status.setText(f"Save failed: {err}"))
+        worker.start()
 
     # ---------------- exposure auto-tune ----------------
     def start_tune(self):
@@ -1395,11 +1507,12 @@ class MainWindow(QMainWindow):
         self.progress.hide()
         try:
             path = unique_path(self.stack_dir, f"result-{self.stack_mode_used}")
-            save_png(path, result)
-            message = f"Stack saved to {path}"
+            worker = SaveThread(path, result)
+            worker.done.connect(lambda saved: self.show_still(result, f"Stack saved to {saved}"))
+            worker.failed.connect(lambda err: self.show_still(result, f"Stack done but save failed: {err}"))
+            worker.start()
         except OSError as exc:
-            message = f"Stack done but save failed: {exc}"
-        self.show_still(result, message)
+            self.show_still(result, f"Stack done but save failed: {exc}")
 
     @Slot(str)
     def on_stack_failed(self, text):
@@ -1411,7 +1524,8 @@ class MainWindow(QMainWindow):
         self.auto_timer.stop()
         self.tune_timer.stop()
         self.stop_thumbs()
-        self.cam.stop()
+        if self.cam is not None:
+            self.cam.stop()
         self.controls.shutdown()
         if self.stack_thread is not None and self.stack_thread.isRunning():
             self.stack_thread.wait(10000)
